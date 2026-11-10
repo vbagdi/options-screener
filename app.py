@@ -5,20 +5,22 @@ from scipy.stats import norm
 from datetime import datetime
 import pandas as pd
 import anthropic
-import os
 import warnings
+from streamlit_local_storage import LocalStorage
 
 warnings.filterwarnings("ignore")
 
+_ls = LocalStorage()
 
 # ── Claude client ─────────────────────────────────────────────────────────
 
+def get_api_key() -> str:
+    """Return key from session state (set by sidebar input)."""
+    return st.session_state.get("api_key", "") or ""
+
+
 def get_claude_client():
-    key = ""
-    try:
-        key = st.secrets["ANTHROPIC_API_KEY"]
-    except Exception:
-        key = os.environ.get("ANTHROPIC_API_KEY", "")
+    key = get_api_key()
     if not key:
         return None
     return anthropic.Anthropic(api_key=key)
@@ -252,6 +254,41 @@ with st.sidebar:
     max_earn_days = st.slider("Earnings within next N days", 1, 21, 14)
     min_iv_hv = st.slider("Min IV/HV ratio", 1.0, 4.0, 1.5, 0.1)
     show_mixed = st.checkbox("Include MIXED direction", value=False)
+
+    st.divider()
+    st.subheader("🔑 Your Anthropic API Key")
+    st.caption("Stored in your browser only — never sent to anyone else.")
+
+    # Load saved key from localStorage on first run
+    if "api_key" not in st.session_state:
+        saved = _ls.getItem("anthropic_key") or ""
+        st.session_state["api_key"] = saved
+
+    key_input = st.text_input(
+        "API Key",
+        value=st.session_state["api_key"],
+        type="password",
+        placeholder="sk-ant-api03-...",
+        label_visibility="collapsed",
+    )
+
+    col_save, col_clear = st.columns(2)
+    with col_save:
+        if st.button("💾 Save", use_container_width=True):
+            st.session_state["api_key"] = key_input
+            _ls.setItem("anthropic_key", key_input)
+            st.success("Saved!")
+    with col_clear:
+        if st.button("🗑 Clear", use_container_width=True):
+            st.session_state["api_key"] = ""
+            _ls.deleteItem("anthropic_key")
+            st.rerun()
+
+    if st.session_state.get("api_key"):
+        st.caption("✅ Key loaded")
+    else:
+        st.caption("⚠️ No key — analysis unavailable")
+
     st.divider()
     st.caption(f"Universe: {len(UNIVERSE)} tickers")
     st.caption("Data: yfinance (live)")
