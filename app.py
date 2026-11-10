@@ -203,7 +203,36 @@ def get_claude_client():
     return anthropic.Anthropic(api_key=key)
 
 
-def build_prompt(r):
+SYSTEM_PROMPT = """You are an options trading analyst for a small group of friends doing backtesting (no real orders placed ever).
+
+You analyze earnings plays using MA direction + GEX methodology. Talk like a knowledgeable friend — direct, honest, conversational. No disclaimers, no "this is not financial advice", no robotic bullet lists unless they help.
+
+**How you analyze:**
+- Direction is the foundation: UP means spot > MA20 > MA50, DOWN means spot < MA20 < MA50, MIXED means tangled. MIXED = weak setup.
+- GEX tells you what dealers will do: negative GEX (DESTABILIZING) means dealers are short gamma and will accelerate moves. Positive GEX (stabilizing) means they hedge by buying dips/selling rips — acts like a magnet.
+- Best setups: DOWN direction + negative GEX (put play), or UP direction + positive GEX (call play). Both signals pointing the same way = higher conviction.
+- IV/HV ratio: above 2x means you're paying a lot of premium vs realized vol — that's fine for earnings but be aware of IV crush post-report. Under 1.5x is cheap.
+- Expected move = spot × ATM IV × √(DTE/365). Strikes within the expected move have a real chance of being ITM. Beyond it = lottery ticket.
+
+**Track record context (so you understand the edge and limits):**
+- Wins: GOOGL put (DOWN + destab, earnings drop played out), INTC put (DOWN + destab + cash flow collapse thesis), COHR put (DOWN + destab + $725M GAAP/OCF gap)
+- Losses: UBER put (DOWN + destab but beat earnings and ripped +7%), SMCI put (gapped up on earnings), AAPL put (bounced back after drop)
+- Key lesson: direction + GEX gives probabilistic edge but earnings are binary. A company can have DOWN direction and negative GEX and still rip 8% if it beats and guides strong. The edge is real but it's maybe 60/40 not 90/10.
+
+**Style:**
+- When conviction is high, say so and say why specifically (e.g. "stock is 20% below MA20, all GEX below spot is negative, and their cash flow situation is deteriorating")
+- When conviction is low, say skip and move on
+- Give ONE specific best play: exact strike, cost per contract, what price the stock needs to reach for it to be profitable
+- Always name the one thing that kills the trade (usually: company beats and guides strong, IV crush, or stock already oversold and bounces)
+- Be honest about uncertainty — you've had losses too
+
+**Critical rules:**
+- Backtesting only. No real orders ever.
+- Never use a number that wasn't fetched in this run.
+- If something can't be computed, say so."""
+
+
+def build_context_message(r):
     puts_txt = r["puts"].to_string(index=False) if not r["puts"].empty else "(none)"
     calls_txt = r["calls"].to_string(index=False) if not r["calls"].empty else "(none)"
     gex_nearby = sorted(
@@ -211,17 +240,17 @@ def build_prompt(r):
         key=lambda x: x[0],
     )
     gex_txt = "\n".join(f"  ${k:.1f}: {v/1e6:+.1f}M" for k, v in gex_nearby) or "  (none)"
-    earn_str = f"in {r['earn_days']} days ({r['earn_date']})" if r["earn_days"] is not None else "not found in next 60 days"
+    earn_str = f"in {r['earn_days']} days ({r['earn_date']})" if r["earn_days"] is not None else "not in next 60 days"
 
-    return f"""You are an options screener assistant. A friend is backtesting earnings plays (no real orders). Given the data below, give a concise analysis.
+    return f"""Here's the screener data for {r['sym']}. What's the play?
 
 TICKER: {r['sym']}
 Spot: ${r['spot']:.2f}
 Direction: {r['direction']} (MA20: ${r['ma20']:.2f}, MA50: ${r['ma50']:.2f})
-HV30: {r['hv30']*100:.1f}%  |  ATM IV: {r['atm_iv']*100:.1f}%  |  IV/HV: {r['iv_hv']:.2f}x
+HV30: {r['hv30']*100:.1f}% | ATM IV: {r['atm_iv']*100:.1f}% | IV/HV: {r['iv_hv']:.2f}x
 Net GEX: {r['net_gex']/1e6:.1f}M ({'DESTABILIZING' if r['net_gex'] < 0 else 'stabilizing'})
 Expected move: ±${r['exp_move']:.2f}
-Earnings: {earn_str} (expiry used: {r['expiry']})
+Earnings: {earn_str} | Expiry used: {r['expiry']}
 
 GEX by strike (±10% of spot):
 {gex_txt}
@@ -230,48 +259,59 @@ PUTS:
 {puts_txt}
 
 CALLS:
-{calls_txt}
-
-Analyze in this exact order — keep total response under 180 words:
-1. **Conviction** — does direction align with GEX? (high / medium / low, one sentence why)
-2. **IV/HV** — are you overpaying for the option?
-3. **Best play** — exact strike, cost per contract, what move it needs to be profitable
-4. **Main risk** — single sentence on what kills this trade
-5. **Verdict** — ENTER / SKIP / WAIT with one-line reason
-
-Be direct. No disclaimers."""
+{calls_txt}"""
 
 
-def render_analysis_button(r):
-    analysis_key = f"analysis_{r['sym']}"
-    col_btn, col_clear = st.columns([3, 1])
-    with col_btn:
-        run_analysis = st.button(f"🤖 Get Claude Analysis — {r['sym']}", key=f"btn_{r['sym']}")
-    with col_clear:
-        if st.session_state.get(analysis_key):
-            if st.button("↺ Re-run", key=f"clr_{r['sym']}"):
-                del st.session_state[analysis_key]
+def render_chat(r):
+    chat_key = f"chat_{r['sym']}"
+    if chat_key not in st.session_state:
+        st.session_state[chat_key] = []
+
+    client = get_claude_client()
+    if client is None:
+        st.warning("Enter your Anthropic API key in the sidebar to enable analysis.")
+        return
+
+    # Render existing messages
+    for msg in st.session_state[chat_key]:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    # First message: auto-analysis button
+    if not st.session_state[chat_key]:
+        if st.button(f"🤖 Analyze {r['sym']}", key=f"start_{r['sym']}"):
+            first_msg = build_context_message(r)
+            st.session_state[chat_key].append({"role": "user", "content": first_msg})
+            with st.chat_message("assistant"):
+                response = st.write_stream(_stream(client, st.session_state[chat_key]))
+            st.session_state[chat_key].append({"role": "assistant", "content": response})
+            st.rerun()
+    else:
+        # Follow-up input
+        col_input, col_reset = st.columns([5, 1])
+        with col_reset:
+            if st.button("🗑", key=f"reset_{r['sym']}", help="Clear chat"):
+                del st.session_state[chat_key]
                 st.rerun()
 
-    if run_analysis:
-        client = get_claude_client()
-        if client is None:
-            st.warning("Enter your Anthropic API key in the sidebar first.")
-        else:
-            out = st.empty()
-            full_text = ""
-            with client.messages.stream(
-                model="claude-sonnet-4-6",
-                max_tokens=400,
-                messages=[{"role": "user", "content": build_prompt(r)}],
-            ) as stream:
-                for chunk in stream.text_stream:
-                    full_text += chunk
-                    out.markdown(full_text + "▌")
-            out.markdown(full_text)
-            st.session_state[analysis_key] = full_text
-    elif st.session_state.get(analysis_key):
-        st.markdown(st.session_state[analysis_key])
+        if user_msg := st.chat_input(f"Ask about {r['sym']}…", key=f"chat_input_{r['sym']}"):
+            st.session_state[chat_key].append({"role": "user", "content": user_msg})
+            with st.chat_message("user"):
+                st.markdown(user_msg)
+            with st.chat_message("assistant"):
+                response = st.write_stream(_stream(client, st.session_state[chat_key]))
+            st.session_state[chat_key].append({"role": "assistant", "content": response})
+
+
+def _stream(client, messages):
+    with client.messages.stream(
+        model="claude-sonnet-4-6",
+        max_tokens=600,
+        system=SYSTEM_PROMPT,
+        messages=messages,
+    ) as stream:
+        for chunk in stream.text_stream:
+            yield chunk
 
 
 def render_result_card(r, expanded=False):
@@ -314,7 +354,7 @@ def render_result_card(r, expanded=False):
                 st.dataframe(r["calls"], hide_index=True, use_container_width=True)
 
         st.divider()
-        render_analysis_button(r)
+        render_chat(r)
 
 
 # ── Sidebar ───────────────────────────────────────────────────────────────
