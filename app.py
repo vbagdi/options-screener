@@ -45,6 +45,8 @@ def bs_gamma(S, K, T, r, sigma):
 
 def get_direction(t):
     hist = t.history(period="6mo")["Close"].dropna()
+    if len(hist) < 50:
+        raise ValueError(f"Insufficient price history — only {len(hist)} bars returned (yfinance may be rate-limiting)")
     spot = float(hist.iloc[-1])
     ma20 = float(hist.rolling(20).mean().iloc[-1])
     ma50 = float(hist.rolling(50).mean().iloc[-1])
@@ -82,8 +84,9 @@ def compute_gex(t, spot, max_days=45):
     r = 0.05
     net_gex = 0.0
     gex_by_strike = {}
+    today = datetime.utcnow().date()
     for exp in t.options:
-        T = (datetime.strptime(exp, "%Y-%m-%d") - datetime.today()).days
+        T = (datetime.strptime(exp, "%Y-%m-%d").date() - today).days
         if T <= 0 or T > max_days:
             continue
         T_yr = T / 365
@@ -143,8 +146,9 @@ def get_chain(t, expiry, spot, direction):
 
 
 def pick_expiry(t, min_days_out=1):
+    today = datetime.utcnow().date()
     for exp in t.options:
-        d = (datetime.strptime(exp, "%Y-%m-%d") - datetime.today()).days
+        d = (datetime.strptime(exp, "%Y-%m-%d").date() - today).days
         if d >= min_days_out:
             return exp
     return None
@@ -156,7 +160,10 @@ def build_result(sym, t, earn_date, earn_days):
     min_dte = (earn_days + 1) if earn_days is not None else 1
     expiry = pick_expiry(t, min_dte)
     if expiry is None:
-        return None
+        all_exps = list(t.options)
+        if not all_exps:
+            raise ValueError(f"yfinance returned no options expirations for {sym} — likely rate-limited on this IP")
+        raise ValueError(f"No expiry found with >={min_dte} DTE for {sym}. Available expirations: {all_exps[:6]}")
     puts, calls, atm_iv = get_chain(t, expiry, spot, direction)
     exp_move = spot * atm_iv * np.sqrt(max(earn_days or 1, 1) / 365) if atm_iv > 0 else 0.0
     iv_hv = atm_iv / hv30 if hv30 > 0 else 0.0
