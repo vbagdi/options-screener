@@ -4,9 +4,68 @@ import numpy as np
 from scipy.stats import norm
 from datetime import datetime
 import pandas as pd
+import anthropic
+import os
 import warnings
 
 warnings.filterwarnings("ignore")
+
+
+# ── Claude client ─────────────────────────────────────────────────────────
+
+def get_claude_client():
+    key = ""
+    try:
+        key = st.secrets["ANTHROPIC_API_KEY"]
+    except Exception:
+        key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not key:
+        return None
+    return anthropic.Anthropic(api_key=key)
+
+
+def build_prompt(r: dict) -> str:
+    puts_txt = ""
+    if not r["puts"].empty:
+        puts_txt = r["puts"].to_string(index=False)
+    calls_txt = ""
+    if not r["calls"].empty:
+        calls_txt = r["calls"].to_string(index=False)
+
+    gex_nearby = sorted(
+        [(k, v) for k, v in r["gex_by_strike"].items() if abs(k - r["spot"]) / r["spot"] < 0.10],
+        key=lambda x: x[0],
+    )
+    gex_txt = "\n".join(f"  ${k:.1f}: {v/1e6:+.1f}M" for k, v in gex_nearby) or "  (none)"
+
+    return f"""You are an options screener assistant. A friend is backtesting earnings plays (no real orders). Given the data below, give a concise analysis.
+
+TICKER: {r['sym']}
+Spot: ${r['spot']:.2f}
+Direction: {r['direction']} (MA20: ${r['ma20']:.2f}, MA50: ${r['ma50']:.2f})
+HV30: {r['hv30']*100:.1f}%  |  ATM IV: {r['atm_iv']*100:.1f}%  |  IV/HV: {r['iv_hv']:.2f}x
+Net GEX: {r['net_gex']/1e6:.1f}M ({'DESTABILIZING' if r['net_gex'] < 0 else 'stabilizing'})
+Expected move: ±${r['exp_move']:.2f}
+Earnings: in {r['earn_days']} days (expiry used: {r['expiry']})
+
+GEX by strike (±10% of spot):
+{gex_txt}
+
+{'PUTS:' if puts_txt else ''}
+{puts_txt}
+{'CALLS:' if calls_txt else ''}
+{calls_txt}
+
+Analyze in this exact order — keep total response under 180 words:
+1. **Conviction** — does direction align with GEX? (high / medium / low, one sentence why)
+2. **IV/HV** — are you overpaying for the option?
+3. **Best play** — exact strike, cost per contract, what move it needs to be profitable
+4. **Main risk** — single sentence on what kills this trade
+5. **Verdict** — ENTER / SKIP / WAIT with one-line reason
+
+Be direct. No disclaimers."""
+
+
 
 st.set_page_config(
     page_title="Options Earnings Screener",
@@ -309,6 +368,44 @@ if st.session_state.results:
                     with col_c:
                         st.caption(f"**CALLS** — {r['expiry']}")
                         st.dataframe(r["calls"], hide_index=True, use_container_width=True)
+
+                # Claude analysis
+                st.divider()
+                analysis_key = f"analysis_{r['sym']}"
+
+                col_btn, col_clear = st.columns([3, 1])
+                with col_btn:
+                    run_analysis = st.button(
+                        f"🤖 Get Claude Analysis — {r['sym']}",
+                        key=f"btn_{r['sym']}",
+                    )
+                with col_clear:
+                    if st.session_state.get(analysis_key):
+                        if st.button("↺ Refresh", key=f"clr_{r['sym']}"):
+                            st.session_state[analysis_key] = None
+                            st.rerun()
+
+                if run_analysis:
+                    out = st.empty()
+                    client = get_claude_client()
+                    if client is None:
+                        st.warning("Set ANTHROPIC_API_KEY in Streamlit secrets (Settings → Secrets) or as an env variable.")
+                    else:
+                        prompt = build_prompt(r)
+                        full_text = ""
+                        with client.messages.stream(
+                            model="claude-sonnet-4-6",
+                            max_tokens=400,
+                            messages=[{"role": "user", "content": prompt}],
+                        ) as stream:
+                            for chunk in stream.text_stream:
+                                full_text += chunk
+                                out.markdown(full_text + "▌")
+                        out.markdown(full_text)
+                        st.session_state[analysis_key] = full_text
+
+                elif st.session_state.get(analysis_key):
+                    st.markdown(st.session_state[analysis_key])
 
 elif not run_btn:
     st.info("👆 Hit **Run Scan** to fetch live data and screen the full universe.")
